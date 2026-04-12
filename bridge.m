@@ -11,6 +11,7 @@ static NSMutableArray<WKWebView *> *wallpaperWebViews = nil;
 static WKWebView *webView = nil;
 static id webDelegate = nil;
 static NSString *currentTempHTMLPath = nil;
+static NSString *currentTempHTMLDirectory = nil;
 static NSMutableArray<NSDictionary<NSString *, id> *> *notificationObservers = nil;
 static NSTimer *idleDetectionTimer = nil;
 static BOOL isSystemIdle = NO;
@@ -66,17 +67,27 @@ static NSString *renderHTMLToTempFile(NSString *templatePath, NSString *videoPat
     
     html = [html stringByReplacingOccurrencesOfString:@"{{VIDEO_PATH}}"
                                           withString:fileURL];
-                                          
-        // 写入临时文件
-    NSString *tempDir = NSTemporaryDirectory();
-    NSString *uuid = [[NSUUID UUID] UUIDString];
-    NSString *fileName = [NSString stringWithFormat:@"wallpaper_%@.html", uuid];
+
+    NSString *videoDirectory = [[videoPath stringByDeletingLastPathComponent] stringByStandardizingPath];
+    NSString *runUUID = [[NSUUID UUID] UUIDString];
+    NSString *tempRootDir = [videoDirectory stringByAppendingPathComponent:@".wallpaper4mac"];
+    NSString *tempDir = [tempRootDir stringByAppendingPathComponent:runUUID];
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:tempDir
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:&err]) {
+        NSLog(@"❌ 无法创建 HTML 渲染目录 %@: %@", tempDir, err);
+        return nil;
+    }
+
+    NSString *fileName = [NSString stringWithFormat:@"wallpaper_%@.html", runUUID];
     NSString *tempPath = [tempDir stringByAppendingPathComponent:fileName];
     NSLog(@"📄 生成临时文件: %@", tempPath);
     
     [html writeToFile:tempPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
     
     if (err) return nil;
+    currentTempHTMLDirectory = [tempDir copy];
     return tempPath;
 }
 
@@ -188,9 +199,10 @@ int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
         webView.navigationDelegate = webDelegate;
         [webView setValue:@NO forKey:@"drawsBackground"];
         
-        // 加载 HTML 文件，只授予临时目录读权限
+        // 加载 HTML 文件，仅授予视频所在目录读权限，避免回退到根目录。
         NSURL *htmlURL = [NSURL fileURLWithPath:tempHtmlPath];
-        NSURL *accessURL = [NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES];
+        NSString *videoDirectory = [[videoPath stringByDeletingLastPathComponent] stringByStandardizingPath];
+        NSURL *accessURL = [NSURL fileURLWithPath:videoDirectory isDirectory:YES];
         [webView loadFileURL:htmlURL allowingReadAccessToURL:accessURL];
 
         // 为每个显示器创建一个桌面层窗口，共享同一个 WKWebView 内容
@@ -298,6 +310,11 @@ void CleanupWallpaper() {
             [[NSFileManager defaultManager] removeItemAtPath:currentTempHTMLPath error:nil];
             NSLog(@"🗑️ 临时文件已删除: %@", currentTempHTMLPath);
             currentTempHTMLPath = nil;
+        }
+        if (currentTempHTMLDirectory) {
+            [[NSFileManager defaultManager] removeItemAtPath:currentTempHTMLDirectory error:nil];
+            NSLog(@"🗑️ 临时目录已删除: %@", currentTempHTMLDirectory);
+            currentTempHTMLDirectory = nil;
         }
     }
 }
