@@ -22,17 +22,45 @@ jobs:
         with:
           go-version: '1.24'
       
-      - name: Build
+      - name: Build CLI
         run: |
           unset GOTOOLCHAIN
-          CGO_ENABLED=1 go build -o wallpaper -v .
-          echo "Build completed successfully"
+          CGO_ENABLED=1 go build -o wallpaper-cli -v .
       
-      - name: Upload binary
+      - name: Build GUI
+        run: |
+          unset GOTOOLCHAIN
+          swiftc -o wallpaper-gui gui.swift -framework SwiftUI -framework AppKit
+      
+      - name: Create App Bundle
+        run: |
+          mkdir -p Wallpaper4Mac.app/Contents/MacOS
+          cp wallpaper-cli Wallpaper4Mac.app/Contents/MacOS/
+          cp wallpaper-gui Wallpaper4Mac.app/Contents/MacOS/
+          cat > Wallpaper4Mac.app/Contents/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>wallpaper-gui</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.wallpaper4mac.app</string>
+              <key>CFBundleName</key>
+              <string>Wallpaper4Mac</string>
+              <key>CFBundleVersion</key>
+              <string>1.0.0</string>
+              <key>LSUIElement</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+      
+      - name: Upload App
         uses: actions/upload-artifact@v4
         with:
-          name: wallpaper-darwin-amd64
-          path: wallpaper
+          name: Wallpaper4Mac
+          path: Wallpaper4Mac.app
           retention-days: 30
       
       - name: Create Release (on tag)
