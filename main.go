@@ -415,19 +415,17 @@ func startBackground() error {
 	if err != nil {
 		return err
 	}
-	args := make([]string, 0, len(os.Args))
+	args := append([]string{}, os.Args[1:]...)
 	hasDaemon := false
-	for _, arg := range os.Args[1:] {
+	for _, arg := range args {
 		if arg == "--daemon" || strings.HasPrefix(arg, "--daemon=") {
 			hasDaemon = true
+			break
 		}
-		args = append(args, arg)
 	}
 	if !hasDaemon {
 		args = append(args, "--daemon")
 	}
-
-	args = append(args, "--daemon")
 
 	cmd := exec.Command(exePath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
