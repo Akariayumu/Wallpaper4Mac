@@ -101,7 +101,8 @@ class WallpaperViewModel: ObservableObject {
     
     func checkStatus() {
         let task = Process()
-        task.launchPath = Bundle.main.path(forResource: "wallpaper-cli", ofType: nil) ?? "/usr/local/bin/wallpaper"
+        let cliPath = Bundle.main.bundlePath + "/Contents/MacOS/wallpaper-cli"
+        task.launchPath = cliPath
         task.arguments = ["--cmd", "status"]
         
         let pipe = Pipe()
@@ -133,7 +134,8 @@ class WallpaperViewModel: ObservableObject {
         guard !videoPath.isEmpty else { return }
         
         let task = Process()
-        task.launchPath = Bundle.main.path(forResource: "wallpaper-cli", ofType: nil) ?? "/usr/local/bin/wallpaper"
+        let cliPath = Bundle.main.bundlePath + "/Contents/MacOS/wallpaper-cli"
+        task.launchPath = cliPath
         task.arguments = ["--video", videoPath]
         task.launch()
         
@@ -144,7 +146,8 @@ class WallpaperViewModel: ObservableObject {
     
     func stop() {
         let task = Process()
-        task.launchPath = Bundle.main.path(forResource: "wallpaper-cli", ofType: nil) ?? "/usr/local/bin/wallpaper"
+        let cliPath = Bundle.main.bundlePath + "/Contents/MacOS/wallpaper-cli"
+        task.launchPath = cliPath
         task.arguments = ["--cmd", "stop"]
         task.launch()
         
@@ -155,7 +158,8 @@ class WallpaperViewModel: ObservableObject {
     
     func toggleAutostart() {
         let task = Process()
-        task.launchPath = Bundle.main.path(forResource: "wallpaper-cli", ofType: nil) ?? "/usr/local/bin/wallpaper"
+        let cliPath = Bundle.main.bundlePath + "/Contents/MacOS/wallpaper-cli"
+        task.launchPath = cliPath
         
         if autostart {
             task.arguments = ["--cmd", "enable-autostart", "--video", videoPath]
