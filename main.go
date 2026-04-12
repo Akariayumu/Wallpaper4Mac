@@ -41,6 +41,7 @@ var (
 	videoPath         string
 	cmd               string
 	daemon            bool
+	foreground        bool
 	startupStatusFile string
 )
 
@@ -48,6 +49,7 @@ func init() {
 	flag.StringVar(&videoPath, "video", "", "MP4/MOV 视频文件路径（绝对路径）")
 	flag.StringVar(&cmd, "cmd", "start", "命令: start|stop|status|enable-autostart|disable-autostart")
 	flag.BoolVar(&daemon, "daemon", false, "后台运行模式（内部使用）")
+	flag.BoolVar(&foreground, "foreground", false, "前台运行模式（调试用）")
 	flag.StringVar(&startupStatusFile, "startup-status-file", "", "后台启动状态文件（内部使用）")
 }
 
@@ -57,7 +59,7 @@ func main() {
 	normalizeArgs()
 	flag.Parse()
 
-	if cmd == "start" && !daemon {
+	if cmd == "start" && !daemon && !foreground {
 		if videoPath == "" {
 			fmt.Println("❌ 请指定 --video /path/to/video.mp4")
 			flag.Usage()
