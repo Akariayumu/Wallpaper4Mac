@@ -205,8 +205,8 @@ int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
                               defer:NO
                              screen:screen];
 
-            // 使用桌面壁纸层级（在桌面图标之下，桌面图片之上）
-            [window setLevel:NSWindowLevelDesktop - 1];
+            // 使用桌面层级，让窗口位于桌面图标之下的壁纸层
+            [window setLevel:CGWindowLevelForKey(kCGDesktopWindowLevelKey)];
             [window setOpaque:NO];
             [window setBackgroundColor:[NSColor clearColor]];
             [window setIgnoresMouseEvents:YES];
