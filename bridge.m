@@ -1,12 +1,56 @@
+//go:build darwin
+
 #import <Cocoa/Cocoa.h>
+#import <ApplicationServices/ApplicationServices.h>
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import "bridge.h"
 
-static NSWindow *wallpaperWindow = nil;
+static NSMutableArray<NSWindow *> *wallpaperWindows = nil;
+static NSMutableArray<WKWebView *> *wallpaperWebViews = nil;
 static WKWebView *webView = nil;
 static id webDelegate = nil;
 static NSString *currentTempHTMLPath = nil;
+static NSMutableArray<NSDictionary<NSString *, id> *> *notificationObservers = nil;
+static NSTimer *idleDetectionTimer = nil;
+static BOOL isSystemIdle = NO;
+
+static const NSTimeInterval kIdleDetectionInterval = 5.0;
+static const NSTimeInterval kIdleThreshold = 60.0;
+
+static void broadcastJS(NSString *script) {
+    for (WKWebView *view in wallpaperWebViews) {
+        [view evaluateJavaScript:script completionHandler:nil];
+    }
+}
+
+static void addNotificationObserver(id center, id token) {
+    if (!center || !token) return;
+    if (!notificationObservers) {
+        notificationObservers = [NSMutableArray array];
+    }
+    [notificationObservers addObject:@{
+        @"center": center,
+        @"token": token,
+    }];
+}
+
+static void updateIdleState(void) {
+    CFTimeInterval idleSeconds =
+        CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,
+                                               kCGAnyInputEventType);
+    BOOL shouldBeIdle = idleSeconds >= kIdleThreshold;
+    if (shouldBeIdle == isSystemIdle) return;
+
+    isSystemIdle = shouldBeIdle;
+    if (!wallpaperWebViews) return;
+
+    if (isSystemIdle) {
+        broadcastJS(@"externalPause()");
+    } else {
+        broadcastJS(@"externalResume()");
+    }
+}
 
 // MARK: - 辅助函数
 static NSString *renderHTMLToTempFile(NSString *templatePath, NSString *videoPath) {
@@ -47,25 +91,61 @@ static NSString *renderHTMLToTempFile(NSString *templatePath, NSString *videoPat
 @end
 
 static void setupSystemNotifications() {
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    NSNotificationCenter *workspaceNC = [[NSWorkspace sharedWorkspace] notificationCenter];
+    NSDistributedNotificationCenter *distributedNC = [NSDistributedNotificationCenter defaultCenter];
+    NSNotificationCenter *defaultNC = [NSNotificationCenter defaultCenter];
     
-    // 系统睡眠/锁屏时暂停
-    [nc addObserverForName:NSWorkspaceWillSleepNotification object:nil queue:nil
-                  usingBlock:^(NSNotification *note) {
-        if (webView) [webView evaluateJavaScript:@"externalPause()" completionHandler:nil];
+    // 系统睡眠时暂停
+    id willSleepToken =
+        [workspaceNC addObserverForName:NSWorkspaceWillSleepNotification object:nil queue:nil
+                             usingBlock:^(NSNotification *note) {
+        if (wallpaperWebViews) broadcastJS(@"externalPause()");
     }];
+    addNotificationObserver(workspaceNC, willSleepToken);
     
-    // 唤醒/解锁时恢复
-    [nc addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:nil
-                  usingBlock:^(NSNotification *note) {
-        if (webView) [webView evaluateJavaScript:@"externalResume()" completionHandler:nil];
+    // 系统唤醒时恢复
+    id didWakeToken =
+        [workspaceNC addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:nil
+                             usingBlock:^(NSNotification *note) {
+        if (wallpaperWebViews) broadcastJS(@"externalResume()");
+        isSystemIdle = NO;
     }];
+    addNotificationObserver(workspaceNC, didWakeToken);
+
+    // 锁屏时暂停
+    id lockedToken =
+        [distributedNC addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil
+                               usingBlock:^(NSNotification *note) {
+        if (wallpaperWebViews) broadcastJS(@"externalPause()");
+    }];
+    addNotificationObserver(distributedNC, lockedToken);
+
+    // 解锁时恢复
+    id unlockedToken =
+        [distributedNC addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil
+                               usingBlock:^(NSNotification *note) {
+        if (wallpaperWebViews) broadcastJS(@"externalResume()");
+        isSystemIdle = NO;
+    }];
+    addNotificationObserver(distributedNC, unlockedToken);
     
     // 应用终止前清理
-    [nc addObserverForName:NSApplicationWillTerminateNotification object:nil queue:nil
-                  usingBlock:^(NSNotification *note) {
+    id terminateToken =
+        [defaultNC addObserverForName:NSApplicationWillTerminateNotification object:nil queue:nil
+                           usingBlock:^(NSNotification *note) {
         CleanupWallpaper();
     }];
+    addNotificationObserver(defaultNC, terminateToken);
+
+    if (!idleDetectionTimer) {
+        idleDetectionTimer = [NSTimer timerWithTimeInterval:kIdleDetectionInterval
+                                                    repeats:YES
+                                                      block:^(__unused NSTimer *timer) {
+            updateIdleState();
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:idleDetectionTimer forMode:NSRunLoopCommonModes];
+        updateIdleState();
+    }
 }
 
 // MARK: - C 桥接函数
@@ -97,41 +177,61 @@ int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
         }
         currentTempHTMLPath = [tempHtmlPath copy];
         
-        // 创建窗口
-        NSRect screenRect = [[NSScreen mainScreen] frame];
-        wallpaperWindow = [[NSWindow alloc]
-            initWithContentRect:screenRect
-                      styleMask:NSWindowStyleMaskBorderless
-                        backing:NSBackingStoreBuffered
-                          defer:NO];
-        
-        [wallpaperWindow setLevel:(NSWindowLevel)(CGWindowLevelForKey(kCGDesktopIconWindowLevelKey) - 1)];
-        [wallpaperWindow setOpaque:NO];
-        [wallpaperWindow setBackgroundColor:[NSColor clearColor]];
-        [wallpaperWindow setIgnoresMouseEvents:YES]; // 点击穿透
-        [wallpaperWindow setHasShadow:NO];
-        [wallpaperWindow setCollectionBehavior:
-            NSWindowCollectionBehaviorCanJoinAllSpaces |
-            NSWindowCollectionBehaviorStationary |
-            NSWindowCollectionBehaviorFullScreenAuxiliary];
-        [wallpaperWindow orderFrontRegardless];
-        
         // 配置 WKWebView
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
-        // config.allowsInlineMediaPlayback = YES;
+        config.allowsInlineMediaPlayback = YES;
         config.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
-        [config.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
-        
-        webView = [[WKWebView alloc] initWithFrame:screenRect configuration:config];
+        [config.preferences setValue:@NO forKey:@"developerExtrasEnabled"];
+
+        NSRect primaryRect = [[NSScreen mainScreen] frame];
+        webView = [[WKWebView alloc] initWithFrame:primaryRect configuration:config];
         webDelegate = [[WallpaperDelegate alloc] init];
         webView.navigationDelegate = webDelegate;
         [webView setValue:@NO forKey:@"drawsBackground"];
-        [wallpaperWindow setContentView:webView];
         
-        // 加载 HTML 文件，并授权访问根目录（解决本地视频加载权限问题）
+        // 加载 HTML 文件，只授予临时目录读权限
         NSURL *htmlURL = [NSURL fileURLWithPath:tempHtmlPath];
-        NSURL *accessURL = [NSURL fileURLWithPath:@"/"];
+        NSURL *accessURL = [NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES];
         [webView loadFileURL:htmlURL allowingReadAccessToURL:accessURL];
+
+        // 为每个显示器创建一个桌面层窗口，共享同一个 WKWebView 内容
+        wallpaperWindows = [NSMutableArray array];
+        wallpaperWebViews = [NSMutableArray array];
+        for (NSScreen *screen in [NSScreen screens]) {
+            NSRect screenRect = [screen frame];
+            NSWindow *window = [[NSWindow alloc]
+                initWithContentRect:screenRect
+                          styleMask:NSWindowStyleMaskBorderless
+                            backing:NSBackingStoreBuffered
+                              defer:NO
+                             screen:screen];
+
+            [window setLevel:(NSWindowLevel)(CGWindowLevelForKey(kCGDesktopIconWindowLevelKey) - 1)];
+            [window setOpaque:NO];
+            [window setBackgroundColor:[NSColor clearColor]];
+            [window setIgnoresMouseEvents:YES];
+            [window setHasShadow:NO];
+            [window setCollectionBehavior:
+                NSWindowCollectionBehaviorCanJoinAllSpaces |
+                NSWindowCollectionBehaviorStationary |
+                NSWindowCollectionBehaviorFullScreenAuxiliary];
+
+            WKWebView *windowWebView;
+            if (screen == [NSScreen mainScreen]) {
+                windowWebView = webView;
+                [windowWebView setFrame:screenRect];
+            } else {
+                windowWebView = [[WKWebView alloc] initWithFrame:screenRect configuration:config];
+                windowWebView.navigationDelegate = webDelegate;
+                [windowWebView setValue:@NO forKey:@"drawsBackground"];
+                [windowWebView loadFileURL:htmlURL allowingReadAccessToURL:accessURL];
+            }
+
+            [window setContentView:windowWebView];
+            [window orderFrontRegardless];
+            [wallpaperWindows addObject:window];
+            [wallpaperWebViews addObject:windowWebView];
+        }
         
         // 设置系统通知
         setupSystemNotifications();
@@ -171,9 +271,25 @@ void RunApp() {
 void CleanupWallpaper() {
     NSLog(@"🧹 CleanupWallpaper 被调用");
     @autoreleasepool {
-        if (wallpaperWindow) {
-            [wallpaperWindow close];
-            wallpaperWindow = nil;
+        if (idleDetectionTimer) {
+            [idleDetectionTimer invalidate];
+            idleDetectionTimer = nil;
+        }
+        isSystemIdle = NO;
+
+        if (notificationObservers) {
+            for (NSDictionary<NSString *, id> *observer in notificationObservers) {
+                [observer[@"center"] removeObserver:observer[@"token"]];
+            }
+            notificationObservers = nil;
+        }
+
+        if (wallpaperWindows) {
+            for (NSWindow *window in wallpaperWindows) {
+                [window close];
+            }
+            wallpaperWindows = nil;
+            wallpaperWebViews = nil;
             webView = nil;
             webDelegate = nil;
             NSLog(@"👋 壁纸已清理");
