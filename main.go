@@ -427,14 +427,7 @@ func startBackground() error {
 		args = append(args, "--daemon")
 	}
 
-	statusFile, err := os.CreateTemp("", "onlywallpaper-startup-*.status")
-	if err != nil {
-		return err
-	}
-	statusPath := statusFile.Name()
-	statusFile.Close()
-	defer os.Remove(statusPath)
-	args = append(args, "--startup-status-file", statusPath)
+	args = append(args, "--daemon")
 
 	cmd := exec.Command(exePath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -450,33 +443,7 @@ func startBackground() error {
 		return err
 	}
 	devNull.Close()
-	defer cmd.Process.Release()
-
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(statusPath); err == nil {
-			status := strings.TrimSpace(string(data))
-			switch {
-			case strings.HasPrefix(status, "ready:"):
-				return nil
-			case strings.HasPrefix(status, "error:"):
-				return fmt.Errorf(strings.TrimPrefix(status, "error:"))
-			}
-		}
-
-		if !isProcessRunning(cmd.Process.Pid) {
-			if data, err := os.ReadFile(statusPath); err == nil && len(data) > 0 {
-				status := strings.TrimSpace(string(data))
-				if strings.HasPrefix(status, "error:") {
-					return fmt.Errorf(strings.TrimPrefix(status, "error:"))
-				}
-			}
-			return fmt.Errorf("后台进程在初始化完成前退出")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	return fmt.Errorf("后台进程初始化超时")
+	return cmd.Process.Release()
 }
 
 func stopWallpaper() {
