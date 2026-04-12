@@ -1,3 +1,5 @@
+//go:build darwin
+
 package main
 
 /*
@@ -8,7 +10,9 @@ package main
 */
 import "C"
 import (
+	"bytes"
 	"embed"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"log"
@@ -30,18 +34,21 @@ var embeddedAssets embed.FS
 
 const (
 	lockFile = "/tmp/desktop-wallpaper.lock"
+	pidFile  = "/tmp/desktop-wallpaper.pid"
 )
 
 var (
-	videoPath string
-	cmd       string
-	daemon    bool
+	videoPath         string
+	cmd               string
+	daemon            bool
+	startupStatusFile string
 )
 
 func init() {
 	flag.StringVar(&videoPath, "video", "", "MP4/MOV 视频文件路径（绝对路径）")
 	flag.StringVar(&cmd, "cmd", "start", "命令: start|stop|status|enable-autostart|disable-autostart")
 	flag.BoolVar(&daemon, "daemon", false, "后台运行模式（内部使用）")
+	flag.StringVar(&startupStatusFile, "startup-status-file", "", "后台启动状态文件（内部使用）")
 }
 
 func main() {
@@ -111,17 +118,21 @@ func main() {
 
 			if !locked {
 				fmt.Println("❌ 无法获取锁，请手动运行: wallpaper stop")
-				os.Exit(1)
+				failStartup("无法获取锁，请手动运行: wallpaper stop")
 			}
 		} else {
 			log.Println("✅ 首次锁获取成功")
 		}
 		// 写入当前 PID
-		writePID()
+		if err := writePID(); err != nil {
+			fmt.Printf("❌ 无法写入 PID 文件: %v\n", err)
+			lock.Unlock()
+			failStartup("无法写入 PID 文件: %v", err)
+		}
 		defer func() {
 			log.Println("🔓 释放锁并清理 PID 文件")
 			lock.Unlock()
-			os.Remove(lockFile)
+			os.Remove(pidFile)
 		}()
 	}
 
@@ -151,6 +162,28 @@ func main() {
 	}
 }
 
+func failStartup(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	writeStartupStatus("error:" + msg)
+	fmt.Println("❌ " + msg)
+	os.Exit(1)
+}
+
+func writeStartupStatus(status string) {
+	if startupStatusFile == "" {
+		return
+	}
+	_ = os.WriteFile(startupStatusFile, []byte(status), 0600)
+}
+
+func escapePlistString(value string) (string, error) {
+	var buf bytes.Buffer
+	if err := xml.EscapeText(&buf, []byte(value)); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
 func enableAutostart(video string) {
 	absPath, err := filepath.Abs(video)
 	if err != nil {
@@ -164,19 +197,32 @@ func enableAutostart(video string) {
 		return
 	}
 
+	escapedExePath, err := escapePlistString(exePath)
+	if err != nil {
+		fmt.Printf("❌ 无法转义程序路径: %v\n", err)
+		return
+	}
+	escapedVideoPath, err := escapePlistString(absPath)
+	if err != nil {
+		fmt.Printf("❌ 无法转义视频路径: %v\n", err)
+		return
+	}
+
 	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.onlywallpaper</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>%s</string>
-        <string>--video</string>
-        <string>%s</string>
-        <string>--daemon</string>
-    </array>
+	<dict>
+	    <key>Label</key>
+	    <string>com.user.onlywallpaper</string>
+	    <key>ProgramArguments</key>
+	    <array>
+	        <string>%s</string>
+	        <string>--cmd</string>
+	        <string>start</string>
+	        <string>--video</string>
+	        <string>%s</string>
+	        <string>--daemon</string>
+	    </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -186,7 +232,7 @@ func enableAutostart(video string) {
     <key>StandardErrorPath</key>
     <string>/dev/null</string>
 </dict>
-</plist>`, exePath, absPath)
+</plist>`, escapedExePath, escapedVideoPath)
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -269,35 +315,30 @@ func startWallpaper(video string) {
 	// 路径规范化
 	absPath, err := filepath.Abs(video)
 	if err != nil {
-		fmt.Printf("❌ 无效路径: %v\n", err)
-		os.Exit(1)
+		failStartup("无效路径: %v", err)
 	}
 
 	// 校验 MP4
 	if absPath != "" && !strings.HasSuffix(strings.ToLower(absPath), ".mp4") && !strings.HasSuffix(strings.ToLower(absPath), ".mov") {
-		fmt.Println("❌ 仅支持 .mp4/.mov 格式视频")
-		os.Exit(1)
+		failStartup("仅支持 .mp4/.mov 格式视频")
 	}
 
 	// 从嵌入的文件系统中提取模板到临时位置
 	templateContent, err := embeddedAssets.ReadFile("assets/player.html")
 	if err != nil {
-		fmt.Printf("❌ 无法读取内嵌的 HTML 模板: %v\n", err)
-		os.Exit(1)
+		failStartup("无法读取内嵌的 HTML 模板: %v", err)
 	}
 
 	// 创建临时 HTML 文件
 	tmpFile, err := os.CreateTemp("", "player-*.html")
 	if err != nil {
-		fmt.Printf("❌ 无法创建临时文件: %v\n", err)
-		os.Exit(1)
+		failStartup("无法创建临时文件: %v", err)
 	}
 	defer os.Remove(tmpFile.Name())
 
 	if _, err := tmpFile.Write(templateContent); err != nil {
 		tmpFile.Close()
-		fmt.Printf("❌ 无法写入模板数据: %v\n", err)
-		os.Exit(1)
+		failStartup("无法写入模板数据: %v", err)
 	}
 	tmpFile.Close()
 
@@ -319,9 +360,9 @@ func startWallpaper(video string) {
 
 	ret := C.InitWallpaper(cVideo, cTemplate)
 	if ret != 0 {
-		fmt.Println("❌ 壁纸启动失败（查看上方错误）")
-		os.Exit(1)
+		failStartup("壁纸启动失败（查看上方错误）")
 	}
+	writeStartupStatus(fmt.Sprintf("ready:%d", os.Getpid()))
 
 	// 优雅退出处理
 	go func() {
@@ -386,6 +427,15 @@ func startBackground() error {
 		args = append(args, "--daemon")
 	}
 
+	statusFile, err := os.CreateTemp("", "onlywallpaper-startup-*.status")
+	if err != nil {
+		return err
+	}
+	statusPath := statusFile.Name()
+	statusFile.Close()
+	defer os.Remove(statusPath)
+	args = append(args, "--startup-status-file", statusPath)
+
 	cmd := exec.Command(exePath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	devNull, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
@@ -400,7 +450,33 @@ func startBackground() error {
 		return err
 	}
 	devNull.Close()
-	return cmd.Process.Release()
+	defer cmd.Process.Release()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(statusPath); err == nil {
+			status := strings.TrimSpace(string(data))
+			switch {
+			case strings.HasPrefix(status, "ready:"):
+				return nil
+			case strings.HasPrefix(status, "error:"):
+				return fmt.Errorf(strings.TrimPrefix(status, "error:"))
+			}
+		}
+
+		if !isProcessRunning(cmd.Process.Pid) {
+			if data, err := os.ReadFile(statusPath); err == nil && len(data) > 0 {
+				status := strings.TrimSpace(string(data))
+				if strings.HasPrefix(status, "error:") {
+					return fmt.Errorf(strings.TrimPrefix(status, "error:"))
+				}
+			}
+			return fmt.Errorf("后台进程在初始化完成前退出")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return fmt.Errorf("后台进程初始化超时")
 }
 
 func stopWallpaper() {
@@ -408,8 +484,13 @@ func stopWallpaper() {
 	pid, err := readPID()
 	if err != nil || pid == 0 {
 		fmt.Println("⚠️  未检测到运行中的壁纸实例")
-		// 清理可能存在的僵尸锁文件
-		os.Remove(lockFile)
+		os.Remove(pidFile)
+		return
+	}
+
+	if !isProcessRunning(pid) {
+		fmt.Println("⚠️  发现陈旧 PID，已清理状态文件")
+		os.Remove(pidFile)
 		return
 	}
 
@@ -417,7 +498,7 @@ func stopWallpaper() {
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		fmt.Println("⚠️  进程已不存在")
-		os.Remove(lockFile)
+		os.Remove(pidFile)
 		return
 	}
 
@@ -434,7 +515,7 @@ func stopWallpaper() {
 		locked, _ := lock.TryLock()
 		if locked {
 			lock.Unlock()
-			os.Remove(lockFile)
+			os.Remove(pidFile)
 			fmt.Println("✅ 壁纸已停止")
 			return
 		}
@@ -448,22 +529,44 @@ func checkStatus() {
 	locked, _ := lock.TryLock()
 	if locked {
 		lock.Unlock()
+		if pid, err := readPID(); err == nil && pid > 0 && isProcessRunning(pid) {
+			fmt.Printf("⚠️  检测到状态不一致: PID %d 仍在运行，但锁已释放\n", pid)
+			return
+		}
+		os.Remove(pidFile)
 		fmt.Println("⏹️  壁纸状态: 未运行")
 	} else {
-		fmt.Println("✅ 壁纸状态: 运行中")
+		pid, err := readPID()
+		if err != nil || pid == 0 {
+			fmt.Println("⚠️  壁纸状态: 锁存在，但 PID 缺失")
+			return
+		}
+		if !isProcessRunning(pid) {
+			fmt.Printf("⚠️  壁纸状态: 检测到陈旧锁 (PID %d 不存在)\n", pid)
+			return
+		}
+		fmt.Printf("✅ 壁纸状态: 运行中 (PID %d)\n", pid)
 	}
 }
 
-func writePID() {
-	os.WriteFile(lockFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
+func writePID() error {
+	return os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
 }
 
 func readPID() (int, error) {
-	data, err := os.ReadFile(lockFile)
+	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		return 0, err
 	}
 	var pid int
 	fmt.Sscanf(string(data), "%d", &pid)
 	return pid, nil
+}
+
+func isProcessRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, syscall.Signal(0))
+	return err == nil
 }
