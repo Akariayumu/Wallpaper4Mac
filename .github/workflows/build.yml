@@ -24,6 +24,7 @@ jobs:
       
       - name: Build
         run: |
+          unset GOTOOLCHAIN
           CGO_ENABLED=1 go build -o wallpaper -v .
           echo "Build completed successfully"
       
