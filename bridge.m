@@ -179,7 +179,6 @@ int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
         
         // 配置 WKWebView
         WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
-        [config setValue:@YES forKey:@"allowsInlineMediaPlayback"];
         config.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
         [config.preferences setValue:@NO forKey:@"developerExtrasEnabled"];
 
