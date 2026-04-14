@@ -6,7 +6,12 @@ extern "C" {
 #endif
 
 // 初始化壁纸（返回 0 成功，-1 失败）
-int InitWallpaper(const char *videoPath, const char *htmlTemplate);
+int InitWallpaper(const char *videoPath,
+                  const char *htmlTemplate,
+                  double idleThresholdSeconds,
+                  double idlePollIntervalSeconds,
+                  int pauseWhenIdle,
+                  int watchdogIntervalMS);
 
 // 退出清理（自动调用）
 void CleanupWallpaper();

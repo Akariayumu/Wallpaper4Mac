@@ -15,14 +15,21 @@
   </style>
 </head>
 <body>
-  <video id="bg" autoplay loop muted playsinline webkit-playsinline>
+  <video id="bg" autoplay loop muted playsinline webkit-playsinline disablepictureinpicture disableremoteplayback preload="metadata">
     <source src="{{VIDEO_PATH}}" type="video/mp4">
     <source src="{{VIDEO_PATH}}" type="video/quicktime">
   </video>
 
   <script>
     const video = document.getElementById('bg');
+    const watchdogIntervalMs = {{WATCHDOG_INTERVAL_MS}};
     let externallyPaused = false;
+    let watchdogTimer = null;
+
+    video.disablePictureInPicture = true;
+    video.disableRemotePlayback = true;
+    video.defaultMuted = true;
+    video.muted = true;
 
     function tryPlay() {
       if (!externallyPaused) {
@@ -30,12 +37,34 @@
       }
     }
 
+    function stopWatchdog() {
+      if (watchdogTimer !== null) {
+        clearTimeout(watchdogTimer);
+        watchdogTimer = null;
+      }
+    }
+
+    function scheduleWatchdog() {
+      stopWatchdog();
+      if (watchdogIntervalMs <= 0 || document.hidden || externallyPaused) {
+        return;
+      }
+      watchdogTimer = setTimeout(() => {
+        if (!document.hidden && !externallyPaused && video.paused) {
+          tryPlay();
+        }
+        scheduleWatchdog();
+      }, watchdogIntervalMs);
+    }
+
     // 页面可见性控制
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
         video.pause();
+        stopWatchdog();
       } else {
         tryPlay();
+        scheduleWatchdog();
       }
     });
 
@@ -43,28 +72,29 @@
     window.addEventListener('focus', tryPlay);
     window.addEventListener('pageshow', tryPlay);
     document.addEventListener('webkitvisibilitychange', () => {
-      if (!document.hidden) tryPlay();
+      if (!document.hidden) {
+        tryPlay();
+        scheduleWatchdog();
+      }
     });
 
     // 接收 Objective-C 指令
     window.externalPause = () => {
       externallyPaused = true;
       video.pause();
+      stopWatchdog();
     };
     window.externalResume = () => {
       externallyPaused = false;
       tryPlay();
+      scheduleWatchdog();
     };
     window.isPaused = () => video.paused;
 
     // 启动后多尝试几次恢复，降低 WebKit 偶发暂停影响
     setTimeout(tryPlay, 300);
     setTimeout(tryPlay, 1200);
-    setInterval(() => {
-      if (!document.hidden && !externallyPaused && video.paused) {
-        tryPlay();
-      }
-    }, 5000);
+    scheduleWatchdog();
   </script>
 </body>
 </html>

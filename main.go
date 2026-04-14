@@ -43,6 +43,14 @@ var (
 	daemon            bool
 	foreground        bool
 	startupStatusFile string
+	lowPower          bool
+	powerPreset       string
+	listPowerPresets  bool
+	idleThreshold     time.Duration
+	idlePollInterval  time.Duration
+	watchdogInterval  time.Duration
+	explicitFlags     map[string]bool
+	activePowerPreset string
 )
 
 func init() {
@@ -51,6 +59,12 @@ func init() {
 	flag.BoolVar(&daemon, "daemon", false, "后台运行模式（内部使用）")
 	flag.BoolVar(&foreground, "foreground", false, "前台运行模式（调试用）")
 	flag.StringVar(&startupStatusFile, "startup-status-file", "", "后台启动状态文件（内部使用）")
+	flag.BoolVar(&lowPower, "low-power", false, "启用更激进的省电预设")
+	flag.StringVar(&powerPreset, "power-preset", "balanced", "省电预设: balanced|efficiency")
+	flag.BoolVar(&listPowerPresets, "list-power-presets", false, "列出可用省电预设并退出")
+	flag.DurationVar(&idleThreshold, "idle-threshold", 5*time.Minute, "无输入多久后暂停播放，例如 5m")
+	flag.DurationVar(&idlePollInterval, "idle-poll-interval", 15*time.Second, "检测空闲状态的轮询间隔，例如 15s")
+	flag.DurationVar(&watchdogInterval, "watchdog-interval", 30*time.Second, "WebKit 播放恢复看门狗间隔，例如 30s；设为 0 可关闭")
 }
 
 func main() {
@@ -58,6 +72,15 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	normalizeArgs()
 	flag.Parse()
+	explicitFlags = map[string]bool{}
+	flag.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if listPowerPresets {
+		printPowerPresets()
+		return
+	}
 
 	if cmd == "start" && !daemon && !foreground {
 		if videoPath == "" {
@@ -187,6 +210,11 @@ func escapePlistString(value string) (string, error) {
 }
 
 func enableAutostart(video string) {
+	if err := resolvePowerPreset(); err != nil {
+		fmt.Printf("❌ 省电预设无效: %v\n", err)
+		return
+	}
+
 	absPath, err := filepath.Abs(video)
 	if err != nil {
 		fmt.Printf("❌ 路径无效: %v\n", err)
@@ -210,6 +238,35 @@ func enableAutostart(video string) {
 		return
 	}
 
+	var extraArgs strings.Builder
+	if activePowerPreset != "" {
+		extraArgs.WriteString(fmt.Sprintf("\n\t        <string>--power-preset</string>\n\t        <string>%s</string>", activePowerPreset))
+	}
+	if idleThreshold > 0 {
+		escapedIdleThreshold, err := escapePlistString(idleThreshold.String())
+		if err != nil {
+			fmt.Printf("❌ 无法转义 idle-threshold: %v\n", err)
+			return
+		}
+		extraArgs.WriteString(fmt.Sprintf("\n\t        <string>--idle-threshold</string>\n\t        <string>%s</string>", escapedIdleThreshold))
+	}
+	if idlePollInterval > 0 {
+		escapedIdlePoll, err := escapePlistString(idlePollInterval.String())
+		if err != nil {
+			fmt.Printf("❌ 无法转义 idle-poll-interval: %v\n", err)
+			return
+		}
+		extraArgs.WriteString(fmt.Sprintf("\n\t        <string>--idle-poll-interval</string>\n\t        <string>%s</string>", escapedIdlePoll))
+	}
+	if watchdogInterval >= 0 {
+		escapedWatchdog, err := escapePlistString(watchdogInterval.String())
+		if err != nil {
+			fmt.Printf("❌ 无法转义 watchdog-interval: %v\n", err)
+			return
+		}
+		extraArgs.WriteString(fmt.Sprintf("\n\t        <string>--watchdog-interval</string>\n\t        <string>%s</string>", escapedWatchdog))
+	}
+
 	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -223,6 +280,7 @@ func enableAutostart(video string) {
 	        <string>start</string>
 	        <string>--video</string>
 	        <string>%s</string>
+%s
 	        <string>--daemon</string>
 	    </array>
     <key>RunAtLoad</key>
@@ -234,7 +292,7 @@ func enableAutostart(video string) {
     <key>StandardErrorPath</key>
     <string>/dev/null</string>
 </dict>
-</plist>`, escapedExePath, escapedVideoPath)
+</plist>`, escapedExePath, escapedVideoPath, extraArgs.String())
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -314,6 +372,14 @@ func normalizeArgs() {
 }
 
 func startWallpaper(video string) {
+	if err := resolvePowerPreset(); err != nil {
+		failStartup("省电预设无效: %v", err)
+	}
+	applyPowerPreset()
+	if err := validatePowerSettings(); err != nil {
+		failStartup("省电参数无效: %v", err)
+	}
+
 	// 路径规范化
 	absPath, err := filepath.Abs(video)
 	if err != nil {
@@ -349,9 +415,15 @@ func startWallpaper(video string) {
 	// 初始化壁纸
 	fmt.Printf("🎬 正在启动动态壁纸: %s\n", filepath.Base(absPath))
 	fmt.Println("🔋 省电特性:")
+	fmt.Printf("   • 当前预设: %s\n", powerPresetLabel(activePowerPreset))
 	fmt.Println("   • Metal 硬件加速解码")
 	fmt.Println("   • 锁屏/睡眠自动暂停")
-	fmt.Println("   • 5分钟无操作自动暂停")
+	if idleThreshold > 0 {
+		fmt.Printf("   • %s 无操作自动暂停\n", idleThreshold)
+	}
+	if watchdogInterval > 0 {
+		fmt.Printf("   • WebKit 恢复看门狗: %s\n", watchdogInterval)
+	}
 	fmt.Println("   • 静音播放（禁用音频解码）")
 	fmt.Println()
 
@@ -360,7 +432,14 @@ func startWallpaper(video string) {
 	defer C.free(unsafe.Pointer(cVideo))
 	defer C.free(unsafe.Pointer(cTemplate))
 
-	ret := C.InitWallpaper(cVideo, cTemplate)
+	ret := C.InitWallpaper(
+		cVideo,
+		cTemplate,
+		C.double(idleThreshold.Seconds()),
+		C.double(idlePollInterval.Seconds()),
+		C.int(boolToInt(idleThreshold > 0)),
+		C.int(watchdogInterval.Milliseconds()),
+	)
 	if ret != 0 {
 		failStartup("壁纸启动失败（查看上方错误）")
 	}
@@ -384,6 +463,86 @@ func startWallpaper(video string) {
 	// 主循环结束后清理
 	log.Println("🧹 主循环结束，执行最终清理")
 	C.CleanupWallpaper()
+}
+
+func applyPowerPreset() {
+	if activePowerPreset != "efficiency" {
+		return
+	}
+	if !explicitFlags["idle-threshold"] {
+		idleThreshold = 90 * time.Second
+	}
+	if !explicitFlags["idle-poll-interval"] {
+		idlePollInterval = 30 * time.Second
+	}
+	if !explicitFlags["watchdog-interval"] {
+		watchdogInterval = 60 * time.Second
+	}
+}
+
+func resolvePowerPreset() error {
+	preset := strings.ToLower(strings.TrimSpace(powerPreset))
+	switch preset {
+	case "", "default", "balanced":
+		preset = "balanced"
+	case "low", "low-power", "efficiency", "efficient":
+		preset = "efficiency"
+	default:
+		return fmt.Errorf("--power-preset 仅支持 balanced|efficiency")
+	}
+
+	if lowPower {
+		if explicitFlags["power-preset"] && preset != "efficiency" {
+			return fmt.Errorf("--low-power 与 --power-preset=%s 冲突", powerPreset)
+		}
+		preset = "efficiency"
+	}
+
+	powerPreset = preset
+	activePowerPreset = preset
+	return nil
+}
+
+func powerPresetLabel(preset string) string {
+	switch preset {
+	case "efficiency":
+		return "efficiency（更积极省电）"
+	default:
+		return "balanced（默认）"
+	}
+}
+
+func printPowerPresets() {
+	fmt.Println("可用省电预设:")
+	fmt.Println("  balanced   默认预设。保持当前行为：5m 空闲暂停、15s 空闲轮询、30s 恢复看门狗。")
+	fmt.Println("  efficiency 更积极省电：90s 空闲暂停、30s 空闲轮询、60s 恢复看门狗。")
+	fmt.Println()
+	fmt.Println("示例:")
+	fmt.Println("  wallpaper --video /path/to/video.mov --power-preset efficiency")
+	fmt.Println("  wallpaper --video /path/to/video.mov --low-power")
+}
+
+func validatePowerSettings() error {
+	if idleThreshold < 0 {
+		return fmt.Errorf("--idle-threshold 不能小于 0")
+	}
+	if idlePollInterval < 0 {
+		return fmt.Errorf("--idle-poll-interval 不能小于 0")
+	}
+	if watchdogInterval < 0 {
+		return fmt.Errorf("--watchdog-interval 不能小于 0")
+	}
+	if idleThreshold > 0 && idlePollInterval == 0 {
+		return fmt.Errorf("启用空闲暂停时，--idle-poll-interval 不能为 0")
+	}
+	return nil
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func startBackground() error {

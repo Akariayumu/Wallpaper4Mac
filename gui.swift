@@ -60,6 +60,17 @@ struct ContentView: View {
             }
             
             Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("低功耗预设（推荐）", isOn: $viewModel.lowPowerMode)
+                    .onChange(of: viewModel.lowPowerMode) { _, newValue in
+                        viewModel.setLowPowerMode(newValue)
+                    }
+
+                Text(viewModel.lowPowerMode ? "90 秒空闲暂停，30 秒轮询，60 秒恢复检查" : "标准预设：5 分钟空闲暂停，15 秒轮询，30 秒恢复检查")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
             
             // 开机自启
             Toggle("开机自启", isOn: $viewModel.autostart)
@@ -70,7 +81,7 @@ struct ContentView: View {
             Spacer()
         }
         .padding()
-        .frame(width: 300, height: 280)
+        .frame(width: 320, height: 320)
     }
 }
 
@@ -94,8 +105,10 @@ class WallpaperViewModel: ObservableObject {
     @Published var videoPath: String = ""
     @Published var autostart: Bool = false
     @Published var status: String = "未运行"
+    @Published var lowPowerMode: Bool = true
     
     init() {
+        lowPowerMode = UserDefaults.standard.object(forKey: "lowPowerMode") as? Bool ?? true
         checkStatus()
     }
     
@@ -136,7 +149,7 @@ class WallpaperViewModel: ObservableObject {
         let task = Process()
         let cliPath = Bundle.main.bundlePath + "/Contents/MacOS/wallpaper-cli"
         task.launchPath = cliPath
-        task.arguments = ["--video", videoPath]
+        task.arguments = buildLaunchArguments()
         task.launch()
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
@@ -162,10 +175,22 @@ class WallpaperViewModel: ObservableObject {
         task.launchPath = cliPath
         
         if autostart {
-            task.arguments = ["--cmd", "enable-autostart", "--video", videoPath]
+            task.arguments = ["--cmd", "enable-autostart"] + buildLaunchArguments()
         } else {
             task.arguments = ["--cmd", "disable-autostart"]
         }
         task.launch()
+    }
+
+    func setLowPowerMode(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: "lowPowerMode")
+    }
+
+    private func buildLaunchArguments() -> [String] {
+        var arguments = ["--video", videoPath]
+        if lowPowerMode {
+            arguments += ["--power-preset", "efficiency"]
+        }
+        return arguments
     }
 }
