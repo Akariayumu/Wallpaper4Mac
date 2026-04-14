@@ -10,19 +10,30 @@ static NSMutableArray<NSWindow *> *wallpaperWindows = nil;
 static NSMutableArray<WKWebView *> *wallpaperWebViews = nil;
 static WKWebView *webView = nil;
 static id webDelegate = nil;
+static WKProcessPool *sharedProcessPool = nil;
 static NSString *currentTempHTMLPath = nil;
 static NSString *currentTempHTMLDirectory = nil;
 static NSMutableArray<NSDictionary<NSString *, id> *> *notificationObservers = nil;
 static NSTimer *idleDetectionTimer = nil;
 static BOOL isSystemIdle = NO;
-
-static const NSTimeInterval kIdleDetectionInterval = 5.0;
-static const NSTimeInterval kIdleThreshold = 60.0;
+static BOOL isSleepPaused = NO;
+static BOOL isScreenLocked = NO;
+static BOOL shouldPauseWhenIdle = YES;
+static BOOL isPlaybackPaused = NO;
+static NSTimeInterval configuredIdleDetectionInterval = 15.0;
+static NSTimeInterval configuredIdleThreshold = 300.0;
 
 static void broadcastJS(NSString *script) {
     for (WKWebView *view in wallpaperWebViews) {
         [view evaluateJavaScript:script completionHandler:nil];
     }
+}
+
+static void syncPlaybackState(void) {
+    BOOL shouldPause = (shouldPauseWhenIdle && isSystemIdle) || isSleepPaused || isScreenLocked;
+    if (shouldPause == isPlaybackPaused) return;
+    isPlaybackPaused = shouldPause;
+    broadcastJS(shouldPause ? @"externalPause()" : @"externalResume()");
 }
 
 static void addNotificationObserver(id center, id token) {
@@ -37,24 +48,19 @@ static void addNotificationObserver(id center, id token) {
 }
 
 static void updateIdleState(void) {
+    if (!shouldPauseWhenIdle) return;
     CFTimeInterval idleSeconds =
         CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,
                                                kCGAnyInputEventType);
-    BOOL shouldBeIdle = idleSeconds >= kIdleThreshold;
+    BOOL shouldBeIdle = idleSeconds >= configuredIdleThreshold;
     if (shouldBeIdle == isSystemIdle) return;
 
     isSystemIdle = shouldBeIdle;
-    if (!wallpaperWebViews) return;
-
-    if (isSystemIdle) {
-        broadcastJS(@"externalPause()");
-    } else {
-        broadcastJS(@"externalResume()");
-    }
+    syncPlaybackState();
 }
 
 // MARK: - 辅助函数
-static NSString *renderHTMLToTempFile(NSString *templatePath, NSString *videoPath) {
+static NSString *renderHTMLToTempFile(NSString *templatePath, NSString *videoPath, int watchdogIntervalMS) {
     NSError *err = nil;
     NSString *html = [NSString stringWithContentsOfFile:templatePath
                                                encoding:NSUTF8StringEncoding
@@ -67,6 +73,8 @@ static NSString *renderHTMLToTempFile(NSString *templatePath, NSString *videoPat
     
     html = [html stringByReplacingOccurrencesOfString:@"{{VIDEO_PATH}}"
                                           withString:fileURL];
+    html = [html stringByReplacingOccurrencesOfString:@"{{WATCHDOG_INTERVAL_MS}}"
+                                           withString:[NSString stringWithFormat:@"%d", MAX(0, watchdogIntervalMS)]];
 
     NSString *videoDirectory = [[videoPath stringByDeletingLastPathComponent] stringByStandardizingPath];
     NSString *runUUID = [[NSUUID UUID] UUIDString];
@@ -91,6 +99,21 @@ static NSString *renderHTMLToTempFile(NSString *templatePath, NSString *videoPat
     return tempPath;
 }
 
+static WKWebViewConfiguration *createWebViewConfiguration(void) {
+    WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+    config.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
+    config.suppressesIncrementalRendering = YES;
+    config.allowsAirPlayForMediaPlayback = NO;
+    config.allowsPictureInPictureMediaPlayback = NO;
+    if (!sharedProcessPool) {
+        sharedProcessPool = [[WKProcessPool alloc] init];
+    }
+    config.processPool = sharedProcessPool;
+    config.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
+    [config.preferences setValue:@NO forKey:@"developerExtrasEnabled"];
+    return config;
+}
+
 // MARK: - Objective-C 实现
 @interface WallpaperDelegate : NSObject<WKNavigationDelegate>
 @end
@@ -110,7 +133,8 @@ static void setupSystemNotifications() {
     id willSleepToken =
         [workspaceNC addObserverForName:NSWorkspaceWillSleepNotification object:nil queue:nil
                              usingBlock:^(NSNotification *note) {
-        if (wallpaperWebViews) broadcastJS(@"externalPause()");
+        isSleepPaused = YES;
+        syncPlaybackState();
     }];
     addNotificationObserver(workspaceNC, willSleepToken);
     
@@ -118,8 +142,9 @@ static void setupSystemNotifications() {
     id didWakeToken =
         [workspaceNC addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:nil
                              usingBlock:^(NSNotification *note) {
-        if (wallpaperWebViews) broadcastJS(@"externalResume()");
+        isSleepPaused = NO;
         isSystemIdle = NO;
+        syncPlaybackState();
     }];
     addNotificationObserver(workspaceNC, didWakeToken);
 
@@ -127,7 +152,8 @@ static void setupSystemNotifications() {
     id lockedToken =
         [distributedNC addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil
                                usingBlock:^(NSNotification *note) {
-        if (wallpaperWebViews) broadcastJS(@"externalPause()");
+        isScreenLocked = YES;
+        syncPlaybackState();
     }];
     addNotificationObserver(distributedNC, lockedToken);
 
@@ -135,8 +161,9 @@ static void setupSystemNotifications() {
     id unlockedToken =
         [distributedNC addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil
                                usingBlock:^(NSNotification *note) {
-        if (wallpaperWebViews) broadcastJS(@"externalResume()");
+        isScreenLocked = NO;
         isSystemIdle = NO;
+        syncPlaybackState();
     }];
     addNotificationObserver(distributedNC, unlockedToken);
     
@@ -148,19 +175,25 @@ static void setupSystemNotifications() {
     }];
     addNotificationObserver(defaultNC, terminateToken);
 
-    if (!idleDetectionTimer) {
-        idleDetectionTimer = [NSTimer timerWithTimeInterval:kIdleDetectionInterval
+    if (shouldPauseWhenIdle && configuredIdleThreshold > 0 && configuredIdleDetectionInterval > 0 && !idleDetectionTimer) {
+        idleDetectionTimer = [NSTimer timerWithTimeInterval:configuredIdleDetectionInterval
                                                     repeats:YES
                                                       block:^(__unused NSTimer *timer) {
             updateIdleState();
         }];
+        idleDetectionTimer.tolerance = MIN(configuredIdleDetectionInterval * 0.25, 5.0);
         [[NSRunLoop mainRunLoop] addTimer:idleDetectionTimer forMode:NSRunLoopCommonModes];
         updateIdleState();
     }
 }
 
 // MARK: - C 桥接函数
-int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
+int InitWallpaper(const char *videoPathC,
+                  const char *htmlTemplateC,
+                  double idleThresholdSeconds,
+                  double idlePollIntervalSeconds,
+                  int pauseWhenIdle,
+                  int watchdogIntervalMS) {
     NSLog(@"🎬 InitWallpaper 被调用");
     @autoreleasepool {
         // 确保 NSApp 初始化
@@ -169,6 +202,13 @@ int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
 
         NSString *videoPath = [NSString stringWithUTF8String:videoPathC];
         NSString *htmlTemplate = [NSString stringWithUTF8String:htmlTemplateC];
+        configuredIdleThreshold = idleThresholdSeconds > 0 ? idleThresholdSeconds : 300.0;
+        configuredIdleDetectionInterval = idlePollIntervalSeconds > 0 ? idlePollIntervalSeconds : 15.0;
+        shouldPauseWhenIdle = pauseWhenIdle != 0;
+        isSystemIdle = NO;
+        isSleepPaused = NO;
+        isScreenLocked = NO;
+        isPlaybackPaused = NO;
         
         // 路径校验
         if (![[NSFileManager defaultManager] fileExistsAtPath:videoPath]) {
@@ -181,7 +221,7 @@ int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
         }
         
         // 渲染 HTML 到临时文件
-        NSString *tempHtmlPath = renderHTMLToTempFile(htmlTemplate, videoPath);
+        NSString *tempHtmlPath = renderHTMLToTempFile(htmlTemplate, videoPath, watchdogIntervalMS);
         if (!tempHtmlPath) {
             fprintf(stderr, "❌ HTML 渲染失败\n");
             return -1;
@@ -189,15 +229,16 @@ int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
         currentTempHTMLPath = [tempHtmlPath copy];
         
         // 配置 WKWebView
-        WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
-        config.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
-        [config.preferences setValue:@NO forKey:@"developerExtrasEnabled"];
+        WKWebViewConfiguration *config = createWebViewConfiguration();
 
         NSRect primaryRect = [[NSScreen mainScreen] frame];
         webView = [[WKWebView alloc] initWithFrame:primaryRect configuration:config];
         webDelegate = [[WallpaperDelegate alloc] init];
         webView.navigationDelegate = webDelegate;
         [webView setValue:@NO forKey:@"drawsBackground"];
+        if ([webView respondsToSelector:@selector(setUnderPageBackgroundColor:)]) {
+            [webView setUnderPageBackgroundColor:[NSColor clearColor]];
+        }
         
         // 加载 HTML 文件，仅授予视频所在目录读权限，避免回退到根目录。
         NSURL *htmlURL = [NSURL fileURLWithPath:tempHtmlPath];
@@ -233,9 +274,12 @@ int InitWallpaper(const char *videoPathC, const char *htmlTemplateC) {
                 windowWebView = webView;
                 [windowWebView setFrame:screenRect];
             } else {
-                windowWebView = [[WKWebView alloc] initWithFrame:screenRect configuration:config];
+                windowWebView = [[WKWebView alloc] initWithFrame:screenRect configuration:createWebViewConfiguration()];
                 windowWebView.navigationDelegate = webDelegate;
                 [windowWebView setValue:@NO forKey:@"drawsBackground"];
+                if ([windowWebView respondsToSelector:@selector(setUnderPageBackgroundColor:)]) {
+                    [windowWebView setUnderPageBackgroundColor:[NSColor clearColor]];
+                }
                 [windowWebView loadFileURL:htmlURL allowingReadAccessToURL:accessURL];
             }
 
@@ -288,6 +332,9 @@ void CleanupWallpaper() {
             idleDetectionTimer = nil;
         }
         isSystemIdle = NO;
+        isSleepPaused = NO;
+        isScreenLocked = NO;
+        isPlaybackPaused = NO;
 
         if (notificationObservers) {
             for (NSDictionary<NSString *, id> *observer in notificationObservers) {
@@ -304,6 +351,7 @@ void CleanupWallpaper() {
             wallpaperWebViews = nil;
             webView = nil;
             webDelegate = nil;
+            sharedProcessPool = nil;
             NSLog(@"👋 壁纸已清理");
         }
         if (currentTempHTMLPath) {
