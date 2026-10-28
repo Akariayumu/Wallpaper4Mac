@@ -3,6 +3,8 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <WebKit/WebKit.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 #import <objc/runtime.h>
 #import "bridge.h"
 
@@ -15,6 +17,7 @@ static NSString *currentTempHTMLPath = nil;
 static NSString *currentTempHTMLDirectory = nil;
 static NSMutableArray<NSDictionary<NSString *, id> *> *notificationObservers = nil;
 static NSTimer *idleDetectionTimer = nil;
+static NSTimer *idleResumeTimer = nil;
 static BOOL isSystemIdle = NO;
 static BOOL isSleepPaused = NO;
 static BOOL isScreenLocked = NO;
@@ -23,6 +26,15 @@ static BOOL isPlaybackPaused = NO;
 static NSTimeInterval configuredIdleDetectionInterval = 15.0;
 static NSTimeInterval configuredIdleThreshold = 300.0;
 
+// 屏幕关闭、电池供电、前台全屏、其他应用聚焦超过 kFocusPauseDelay 时暂停
+static BOOL isDisplayAsleep = NO;
+static BOOL isOnBattery = NO;
+static BOOL isDesktopCovered = NO;
+static CFRunLoopSourceRef powerSourceLoopSource = NULL;
+static NSTimer *focusTimer = nil;
+static NSDate *frontmostSince = nil;
+static const NSTimeInterval kFocusPauseDelay = 5.0;
+
 static void broadcastJS(NSString *script) {
     for (WKWebView *view in wallpaperWebViews) {
         [view evaluateJavaScript:script completionHandler:nil];
@@ -30,9 +42,13 @@ static void broadcastJS(NSString *script) {
 }
 
 static void syncPlaybackState(void) {
-    BOOL shouldPause = (shouldPauseWhenIdle && isSystemIdle) || isSleepPaused || isScreenLocked;
+    BOOL shouldPause = (shouldPauseWhenIdle && isSystemIdle) || isSleepPaused || isScreenLocked ||
+                       isDisplayAsleep || isOnBattery || isDesktopCovered;
     if (shouldPause == isPlaybackPaused) return;
     isPlaybackPaused = shouldPause;
+    NSLog(@"%@ idle=%d sleep=%d locked=%d displayOff=%d battery=%d covered=%d",
+          shouldPause ? @"⏸️ 暂停" : @"▶️ 恢复",
+          isSystemIdle, isSleepPaused, isScreenLocked, isDisplayAsleep, isOnBattery, isDesktopCovered);
     broadcastJS(shouldPause ? @"externalPause()" : @"externalResume()");
 }
 
@@ -53,9 +69,105 @@ static void updateIdleState(void) {
         CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,
                                                kCGAnyInputEventType);
     BOOL shouldBeIdle = idleSeconds >= configuredIdleThreshold;
+    // 唤醒/解锁会直接清掉 isSystemIdle，这里顺带停掉快速检查
+    if (!isSystemIdle && idleResumeTimer) {
+        [idleResumeTimer invalidate];
+        idleResumeTimer = nil;
+    }
     if (shouldBeIdle == isSystemIdle) return;
 
     isSystemIdle = shouldBeIdle;
+    syncPlaybackState();
+
+    // 空闲暂停期间快速检查输入，触摸/鼠标/键盘一动就恢复，不用等下一次 15~30 秒的轮询
+    [idleResumeTimer invalidate];
+    idleResumeTimer = nil;
+    if (isSystemIdle) {
+        idleResumeTimer = [NSTimer timerWithTimeInterval:0.25
+                                                 repeats:YES
+                                                   block:^(__unused NSTimer *timer) {
+            updateIdleState();
+        }];
+        idleResumeTimer.tolerance = 0.1;
+        [[NSRunLoop mainRunLoop] addTimer:idleResumeTimer forMode:NSRunLoopCommonModes];
+    }
+}
+
+static void updatePowerSourceState(void) {
+    BOOL onBattery = NO;
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    if (info) {
+        CFStringRef type = IOPSGetProvidingPowerSourceType(info);
+        onBattery = type && CFStringCompare(type, CFSTR(kIOPMBatteryPowerKey), 0) == kCFCompareEqualTo;
+        CFRelease(info);
+    }
+    if (onBattery == isOnBattery) return;
+    isOnBattery = onBattery;
+    syncPlaybackState();
+}
+
+static void powerSourceChanged(__unused void *context) {
+    updatePowerSourceState();
+}
+
+// 前台应用在屏幕上是否有普通窗口；*fullScreen 返回其中是否有窗口铺满某个显示器。
+// 只用窗口的 pid/层级/位置，不读窗口标题，所以不需要屏幕录制权限。
+static BOOL appHasVisibleWindow(pid_t pid, BOOL *fullScreen) {
+    *fullScreen = NO;
+    CFArrayRef list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (!list) return NO;
+    BOOL hasWindow = NO;
+    for (NSDictionary *info in (__bridge NSArray *)list) {
+        if ([info[(id)kCGWindowOwnerPID] intValue] != pid) continue;
+        if ([info[(id)kCGWindowLayer] intValue] != 0) continue;
+        if ([info[(id)kCGWindowAlpha] doubleValue] <= 0.0) continue;
+        CGRect bounds;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &bounds)) continue;
+        if (bounds.size.width < 50 || bounds.size.height < 50) continue;
+        hasWindow = YES;
+        for (NSScreen *screen in [NSScreen screens]) {
+            if (CGSizeEqualToSize(bounds.size, NSSizeToCGSize(screen.frame.size))) {
+                *fullScreen = YES;
+                break;
+            }
+        }
+        if (*fullScreen) break;
+    }
+    CFRelease(list);
+    return hasWindow;
+}
+
+static void updateDesktopCovered(void) {
+    [focusTimer invalidate];
+    focusTimer = nil;
+
+    NSRunningApplication *app = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    BOOL fullScreen = NO;
+    BOOL covered = NO;
+    if (app && app.processIdentifier != getpid()) {
+        BOOL hasWindow = appHasVisibleWindow(app.processIdentifier, &fullScreen);
+        // 访达在前台通常就是在看桌面，只在它全屏时才算遮住
+        BOOL isFinder = [app.bundleIdentifier isEqualToString:@"com.apple.finder"];
+        if (fullScreen) {
+            covered = YES;
+        } else if (hasWindow && !isFinder) {
+            NSTimeInterval focused = frontmostSince ? -[frontmostSince timeIntervalSinceNow] : 0;
+            if (focused >= kFocusPauseDelay) {
+                covered = YES;
+            } else {
+                focusTimer = [NSTimer timerWithTimeInterval:kFocusPauseDelay - focused
+                                                    repeats:NO
+                                                      block:^(__unused NSTimer *timer) {
+                    updateDesktopCovered();
+                }];
+                focusTimer.tolerance = 0.5;
+                [[NSRunLoop mainRunLoop] addTimer:focusTimer forMode:NSRunLoopCommonModes];
+            }
+        }
+    }
+    if (covered == isDesktopCovered) return;
+    isDesktopCovered = covered;
     syncPlaybackState();
 }
 
@@ -104,7 +216,10 @@ static WKWebViewConfiguration *createWebViewConfiguration(void) {
     config.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
     config.suppressesIncrementalRendering = YES;
     config.allowsAirPlayForMediaPlayback = NO;
-    config.allowsPictureInPictureMediaPlayback = NO;
+    // 该属性在 macOS 15 SDK 里不存在（player.html 已用 disablepictureinpicture 关掉画中画）
+    if ([config respondsToSelector:@selector(setAllowsPictureInPictureMediaPlayback:)]) {
+        [config setValue:@NO forKey:@"allowsPictureInPictureMediaPlayback"];
+    }
     if (!sharedProcessPool) {
         sharedProcessPool = [[WKProcessPool alloc] init];
     }
@@ -120,6 +235,11 @@ static WKWebViewConfiguration *createWebViewConfiguration(void) {
 
 @implementation WallpaperDelegate
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    // 页面加载前可能已经因电池/全屏等进入暂停，加载完成后按当前状态执行
+    if (isPlaybackPaused) {
+        [webView evaluateJavaScript:@"externalPause()" completionHandler:nil];
+        return;
+    }
     [webView evaluateJavaScript:@"const v=document.getElementById('bg'); if(v){v.play().catch(()=>{});}" completionHandler:nil];
 }
 @end
@@ -166,7 +286,56 @@ static void setupSystemNotifications() {
         syncPlaybackState();
     }];
     addNotificationObserver(distributedNC, unlockedToken);
-    
+
+    // 屏幕关闭时暂停（系统不一定睡眠）
+    id screensSleepToken =
+        [workspaceNC addObserverForName:NSWorkspaceScreensDidSleepNotification object:nil queue:nil
+                             usingBlock:^(NSNotification *note) {
+        isDisplayAsleep = YES;
+        syncPlaybackState();
+    }];
+    addNotificationObserver(workspaceNC, screensSleepToken);
+
+    id screensWakeToken =
+        [workspaceNC addObserverForName:NSWorkspaceScreensDidWakeNotification object:nil queue:nil
+                             usingBlock:^(NSNotification *note) {
+        isDisplayAsleep = NO;
+        syncPlaybackState();
+    }];
+    addNotificationObserver(workspaceNC, screensWakeToken);
+
+    // 切换前台应用：重新计时聚焦时长
+    id activateToken =
+        [workspaceNC addObserverForName:NSWorkspaceDidActivateApplicationNotification object:nil queue:nil
+                             usingBlock:^(NSNotification *note) {
+        frontmostSince = [NSDate date];
+        updateDesktopCovered();
+    }];
+    addNotificationObserver(workspaceNC, activateToken);
+
+    // 进出全屏会切换空间；全屏动画结束后窗口尺寸才稳定，再查一次
+    id spaceToken =
+        [workspaceNC addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification object:nil queue:nil
+                             usingBlock:^(NSNotification *note) {
+        updateDesktopCovered();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            updateDesktopCovered();
+        });
+    }];
+    addNotificationObserver(workspaceNC, spaceToken);
+
+    // 接电/拔电
+    if (!powerSourceLoopSource) {
+        powerSourceLoopSource = IOPSNotificationCreateRunLoopSource(powerSourceChanged, NULL);
+        if (powerSourceLoopSource) {
+            CFRunLoopAddSource(CFRunLoopGetMain(), powerSourceLoopSource, kCFRunLoopCommonModes);
+        }
+    }
+    frontmostSince = [NSDate date];
+    updatePowerSourceState();
+    updateDesktopCovered();
+
     // 应用终止前清理
     id terminateToken =
         [defaultNC addObserverForName:NSApplicationWillTerminateNotification object:nil queue:nil
@@ -180,6 +349,8 @@ static void setupSystemNotifications() {
                                                     repeats:YES
                                                       block:^(__unused NSTimer *timer) {
             updateIdleState();
+            // 前台应用关掉所有窗口时没有通知，顺带复查一次
+            updateDesktopCovered();
         }];
         idleDetectionTimer.tolerance = MIN(configuredIdleDetectionInterval * 0.25, 5.0);
         [[NSRunLoop mainRunLoop] addTimer:idleDetectionTimer forMode:NSRunLoopCommonModes];
@@ -331,6 +502,18 @@ void CleanupWallpaper() {
             [idleDetectionTimer invalidate];
             idleDetectionTimer = nil;
         }
+        [focusTimer invalidate];
+        focusTimer = nil;
+        [idleResumeTimer invalidate];
+        idleResumeTimer = nil;
+        if (powerSourceLoopSource) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), powerSourceLoopSource, kCFRunLoopCommonModes);
+            CFRelease(powerSourceLoopSource);
+            powerSourceLoopSource = NULL;
+        }
+        isDisplayAsleep = NO;
+        isOnBattery = NO;
+        isDesktopCovered = NO;
         isSystemIdle = NO;
         isSleepPaused = NO;
         isScreenLocked = NO;
