@@ -32,6 +32,23 @@ CGO_ENABLED=1 go build -o wallpaper
 
 二进制会内嵌 `assets/player.html`，不需要额外拷贝资源目录。
 
+### 菜单栏程序（GUI）
+
+```bash
+scripts/build-app.sh            # 生成 build/Wallpaper4Mac.app
+scripts/build-app.sh --install  # 并复制到 /Applications
+```
+
+`Wallpaper4Mac.app` 里包含菜单栏界面（`gui.swift`）和命令行主程序 `wallpaper-cli`。菜单栏可以：
+
+- 查看播放状态和暂停原因（电池供电、其他应用在前台等）
+- 手动暂停 / 继续，启动 / 停止
+- 选择视频（会记住；播放中选择会直接换上）
+- 切换低功耗预设
+- 开关“登录时自动播放”：写入 `~/Library/LaunchAgents/com.xstation.wallpaper4mac.plist`，登录后打开本程序并播放上次的视频
+
+界面和壁纸进程之间用分布式通知通信，不轮询。退出菜单栏程序不会停止壁纸。
+
 ## 快速开始
 
 启动：
@@ -151,6 +168,8 @@ ffprobe -v error -select_streams v:0 \
 
 ## 开机自启
 
+推荐用菜单栏程序里的“登录时自动播放”。命令行方式如下（两者不要同时开启）。
+
 设置开机自启时，当前省电预设和相关参数会一起写入 LaunchAgent：
 
 ```bash
@@ -180,6 +199,9 @@ ffprobe -v error -select_streams v:0 \
 
 - 静音播放，避免音频解码。
 - 锁屏、睡眠、解锁、唤醒时自动同步暂停/恢复。
+- 关闭屏幕、电池供电、前台应用全屏时暂停。
+- 其他应用（访达除外）在前台超过 5 秒时暂停，回到桌面恢复。
+- 空闲暂停后检测到触摸/鼠标/键盘输入立即恢复，不用等下一次轮询。
 - 空闲检测定时器支持容差，减少无意义唤醒。
 - WebView 禁用 PiP、AirPlay、持久化站点数据和开发附加功能。
 - GUI 默认开启推荐的低功耗预设。
