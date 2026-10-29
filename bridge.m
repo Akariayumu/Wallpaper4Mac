@@ -30,6 +30,7 @@ static NSTimeInterval configuredIdleThreshold = 300.0;
 static BOOL isDisplayAsleep = NO;
 static BOOL isOnBattery = NO;
 static BOOL isDesktopCovered = NO;
+static BOOL isManuallyPaused = NO;
 static CFRunLoopSourceRef powerSourceLoopSource = NULL;
 static NSTimer *focusTimer = nil;
 static NSDate *frontmostSince = nil;
@@ -41,15 +42,45 @@ static void broadcastJS(NSString *script) {
     }
 }
 
+// 菜单栏 GUI 通过分布式通知查询状态、手动暂停；状态变化时广播给它
+static NSString *const kStateNotification = @"com.xstation.wallpaper4mac.state";
+static NSString *const kQueryNotification = @"com.xstation.wallpaper4mac.query";
+static NSString *const kManualPauseNotification = @"com.xstation.wallpaper4mac.setManualPause";
+
+static void postPlaybackState(BOOL running) {
+    NSMutableArray<NSString *> *reasons = [NSMutableArray array];
+    if (isManuallyPaused) [reasons addObject:@"手动暂停"];
+    if (isOnBattery) [reasons addObject:@"电池供电"];
+    if (isDisplayAsleep) [reasons addObject:@"屏幕已关闭"];
+    if (isScreenLocked) [reasons addObject:@"已锁屏"];
+    if (isSleepPaused) [reasons addObject:@"系统睡眠"];
+    if (isDesktopCovered) [reasons addObject:@"其他应用在前台"];
+    if (shouldPauseWhenIdle && isSystemIdle) [reasons addObject:@"长时间无操作"];
+    [[NSDistributedNotificationCenter defaultCenter]
+        postNotificationName:kStateNotification
+                      object:nil
+                    userInfo:@{
+                        @"running": running ? @"1" : @"0",
+                        @"paused": isPlaybackPaused ? @"1" : @"0",
+                        @"manual": isManuallyPaused ? @"1" : @"0",
+                        @"reasons": [reasons componentsJoinedByString:@"、"],
+                    }
+          deliverImmediately:YES];
+}
+
 static void syncPlaybackState(void) {
     BOOL shouldPause = (shouldPauseWhenIdle && isSystemIdle) || isSleepPaused || isScreenLocked ||
-                       isDisplayAsleep || isOnBattery || isDesktopCovered;
-    if (shouldPause == isPlaybackPaused) return;
-    isPlaybackPaused = shouldPause;
-    NSLog(@"%@ idle=%d sleep=%d locked=%d displayOff=%d battery=%d covered=%d",
-          shouldPause ? @"⏸️ 暂停" : @"▶️ 恢复",
-          isSystemIdle, isSleepPaused, isScreenLocked, isDisplayAsleep, isOnBattery, isDesktopCovered);
-    broadcastJS(shouldPause ? @"externalPause()" : @"externalResume()");
+                       isDisplayAsleep || isOnBattery || isDesktopCovered || isManuallyPaused;
+    if (shouldPause != isPlaybackPaused) {
+        isPlaybackPaused = shouldPause;
+        NSLog(@"%@ idle=%d sleep=%d locked=%d displayOff=%d battery=%d covered=%d manual=%d",
+              shouldPause ? @"⏸️ 暂停" : @"▶️ 恢复",
+              isSystemIdle, isSleepPaused, isScreenLocked, isDisplayAsleep, isOnBattery, isDesktopCovered,
+              isManuallyPaused);
+        broadcastJS(shouldPause ? @"externalPause()" : @"externalResume()");
+    }
+    // 原因变了但暂停状态没变时也通知 GUI，菜单里的原因保持最新
+    postPlaybackState(YES);
 }
 
 static void addNotificationObserver(id center, id token) {
@@ -325,6 +356,22 @@ static void setupSystemNotifications() {
     }];
     addNotificationObserver(workspaceNC, spaceToken);
 
+    // 菜单栏 GUI：查询状态、手动暂停/继续
+    id queryToken =
+        [distributedNC addObserverForName:kQueryNotification object:nil queue:nil
+                               usingBlock:^(NSNotification *note) {
+        postPlaybackState(YES);
+    }];
+    addNotificationObserver(distributedNC, queryToken);
+
+    id manualPauseToken =
+        [distributedNC addObserverForName:kManualPauseNotification object:nil queue:nil
+                               usingBlock:^(NSNotification *note) {
+        isManuallyPaused = [note.userInfo[@"paused"] isEqual:@"1"];
+        syncPlaybackState();
+    }];
+    addNotificationObserver(distributedNC, manualPauseToken);
+
     // 接电/拔电
     if (!powerSourceLoopSource) {
         powerSourceLoopSource = IOPSNotificationCreateRunLoopSource(powerSourceChanged, NULL);
@@ -514,10 +561,12 @@ void CleanupWallpaper() {
         isDisplayAsleep = NO;
         isOnBattery = NO;
         isDesktopCovered = NO;
+        isManuallyPaused = NO;
         isSystemIdle = NO;
         isSleepPaused = NO;
         isScreenLocked = NO;
         isPlaybackPaused = NO;
+        postPlaybackState(NO);
 
         if (notificationObservers) {
             for (NSDictionary<NSString *, id> *observer in notificationObservers) {
