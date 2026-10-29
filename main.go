@@ -4,7 +4,7 @@ package main
 
 /*
 #cgo CFLAGS: -x objective-c -fobjc-arc
-#cgo LDFLAGS: -framework Cocoa -framework WebKit -framework CoreGraphics
+#cgo LDFLAGS: -framework Cocoa -framework WebKit -framework CoreGraphics -framework IOKit
 #include "bridge.h"
 #include <stdlib.h>
 */
@@ -418,6 +418,8 @@ func startWallpaper(video string) {
 	fmt.Printf("   • 当前预设: %s\n", powerPresetLabel(activePowerPreset))
 	fmt.Println("   • Metal 硬件加速解码")
 	fmt.Println("   • 锁屏/睡眠自动暂停")
+	fmt.Println("   • 关闭屏幕/电池供电/前台全屏时暂停")
+	fmt.Println("   • 其他应用聚焦超过 5 秒时暂停，回到桌面（访达）时恢复")
 	if idleThreshold > 0 {
 		fmt.Printf("   • %s 无操作自动暂停\n", idleThreshold)
 	}
