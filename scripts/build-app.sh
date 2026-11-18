@@ -53,5 +53,8 @@ if [[ "${1:-}" == "--install" ]]; then
     pkill -x Wallpaper4Mac 2>/dev/null || true
     rm -rf /Applications/Wallpaper4Mac.app
     cp -R "$APP" /Applications/
-    echo "==> 已安装到 /Applications/Wallpaper4Mac.app"
+    if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+        open -n /Applications/Wallpaper4Mac.app
+    fi
+    echo "==> 已安装并启动 /Applications/Wallpaper4Mac.app"
 fi

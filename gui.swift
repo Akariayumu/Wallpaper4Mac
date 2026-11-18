@@ -13,14 +13,84 @@ private let kManualPauseNotification = Notification.Name("com.xstation.wallpaper
 private let kPIDFile = "/tmp/desktop-wallpaper.pid"
 private let kLoginAgentLabel = "com.xstation.wallpaper4mac"
 private let kLegacyAgentLabel = "com.user.onlywallpaper"
+private let kGitHubRepoURL = URL(string: "https://github.com/Akariayumu/Wallpaper4Mac")!
+
+private struct GitHubMarkShape: Shape {
+    private static let curves: [(CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat)] = [
+        (3.58, 0.0, 0.0, 3.58, 0.0, 8.0),
+        (0.0, 11.54, 2.29, 14.53, 5.47, 15.59),
+        (5.87, 15.66, 6.02, 15.42, 6.02, 15.21),
+        (6.02, 15.02, 6.01, 14.39, 6.01, 13.72),
+        (4.0, 14.09, 3.48, 13.23, 3.32, 12.78),
+        (3.23, 12.55, 2.84, 11.84, 2.5, 11.65),
+        (2.22, 11.5, 1.82, 11.13, 2.49, 11.12),
+        (3.12, 11.11, 3.57, 11.7, 3.72, 11.94),
+        (4.44, 13.15, 5.59, 12.81, 6.05, 12.6),
+        (6.12, 12.08, 6.33, 11.73, 6.56, 11.53),
+        (4.78, 11.33, 2.92, 10.64, 2.92, 7.58),
+        (2.92, 6.71, 3.23, 5.99, 3.74, 5.43),
+        (3.66, 5.23, 3.38, 4.41, 3.82, 3.31),
+        (3.82, 3.31, 4.49, 3.1, 6.02, 4.13),
+        (6.66, 3.95, 7.34, 3.86, 8.02, 3.86),
+        (8.7, 3.86, 9.38, 3.95, 10.02, 4.13),
+        (11.55, 3.09, 12.22, 3.31, 12.22, 3.31),
+        (12.66, 4.41, 12.38, 5.23, 12.3, 5.43),
+        (12.81, 5.99, 13.12, 6.7, 13.12, 7.58),
+        (13.12, 10.65, 11.25, 11.33, 9.47, 11.53),
+        (9.76, 11.78, 10.01, 12.26, 10.01, 13.01),
+        (10.01, 14.08, 10.0, 14.94, 10.0, 15.21),
+        (10.0, 15.42, 10.15, 15.67, 10.55, 15.59),
+        (13.71, 14.53, 16.0, 11.54, 16.0, 8.0),
+        (16.0, 3.58, 12.42, 0.0, 8.0, 0.0),
+    ]
+
+    func path(in rect: CGRect) -> Path {
+        let side = min(rect.width, rect.height)
+        let s = side / 16.0
+        let ox = rect.midX - side / 2.0
+        let oy = rect.midY - side / 2.0
+        var p = Path()
+        p.move(to: CGPoint(x: ox + 8.0 * s, y: oy))
+        for c in Self.curves {
+            p.addCurve(
+                to: CGPoint(x: ox + c.4 * s, y: oy + c.5 * s),
+                control1: CGPoint(x: ox + c.0 * s, y: oy + c.1 * s),
+                control2: CGPoint(x: ox + c.2 * s, y: oy + c.3 * s)
+            )
+        }
+        p.closeSubpath()
+        return p
+    }
+}
+
+private struct GitHubCornerButton: View {
+    @State private var isHovered = false
+
+    var body: some View {
+        Button {
+            NSWorkspace.shared.open(kGitHubRepoURL)
+        } label: {
+            GitHubMarkShape()
+                .fill(isHovered ? Color.primary : Color.secondary)
+                .frame(width: 14, height: 14)
+                .frame(width: 26, height: 26)
+                .background(
+                    Circle().fill(Color.primary.opacity(isHovered ? 0.14 : 0.08))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help("打开 GitHub 仓库 (Akariayumu/Wallpaper4Mac)")
+    }
+}
 
 struct ContentView: View {
     @ObservedObject var viewModel: WallpaperViewModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            // 状态显示
-            HStack(spacing: 10) {
+            // 状态显示 + 右上角 GitHub 仓库入口
+            HStack(alignment: .top, spacing: 10) {
                 Image(systemName: viewModel.symbolName)
                     .font(.title)
                     .foregroundColor(viewModel.symbolColor)
@@ -33,6 +103,8 @@ struct ContentView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+                Spacer(minLength: 8)
+                GitHubCornerButton()
             }
 
             Divider()
